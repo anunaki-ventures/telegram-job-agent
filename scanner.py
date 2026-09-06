@@ -10,6 +10,7 @@ from telethon import TelegramClient, utils
 from telethon.tl import types
 from telethon.errors import FloodWaitError
 from candidate_classifier import classify_post
+from telegram_contact import extract_telegram_contact
 
 # --- persistent resolve guard injected by repair ---
 _RESOLVE_GUARD_DB = "/opt/tg-job-agent/resolve_guard.db"
@@ -57,7 +58,6 @@ API_HASH = os.environ['TG_API_HASH']
 client = TelegramClient('/opt/tg-job-agent/telegram_scanner', API_ID, API_HASH)
 ROLE_WORDS = ['general manager', 'operations manager', 'operation manager', 'project manager', 'program manager', 'property manager', 'construction manager', 'development manager', 'business development', 'sales manager', 'account manager', 'customer success', 'procurement manager', 'purchasing manager', 'supply chain', 'logistics manager', 'warehouse manager', 'production manager', 'e-commerce manager', 'ecommerce manager', 'marketplace manager', 'partnerships manager', 'expansion manager', 'branch manager', 'country manager', 'regional manager', 'area manager', 'hotel manager', 'resort manager', 'restaurant manager', 'f&b manager', 'office manager', 'service manager', 'community manager']
 BAD_WORDS = ['internship', 'intern ', 'unpaid', 'volunteer', 'стажировка', 'без оплаты']
-CONTACT_RE = re.compile('(?<![\\w])@([A-Za-z0-9_]{5,32})')
 
 PRIORITY_COUNTRIES = {
     'indonesia','thailand','vietnam','malaysia','philippines','singapore','cambodia',
@@ -176,8 +176,7 @@ async def scan_source(source):
             text = msg.message.strip()
             if not looks_like_job(text):
                 continue
-            contacts = ['@' + x for x in CONTACT_RE.findall(text)]
-            contact = contacts[0] if contacts else None
+            contact = extract_telegram_contact(text, username)
             key = dedup(username, msg.id, text)
             con = db()
             try:

@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from candidate_classifier import classify_post
+from telegram_contact import extract_telegram_contact
 
 ROOT = Path("/opt/tg-job-agent")
 DB = ROOT / "telegram_jobs.db"
@@ -137,7 +138,7 @@ def already_blocked(con, contact):
     row = con.execute("""
         SELECT 1 FROM send_queue
         WHERE lower(recipient)=?
-          AND status IN ('pending','sent','failed','skipped')
+          AND status IN ('pending','sent','failed','skipped','held_floodwait','held_time')
         LIMIT 1
     """,(c,)).fetchone()
     return bool(row)
@@ -294,8 +295,6 @@ LEFT JOIN sources s
   ON lower(COALESCE(j.source,'')) =
      lower(COALESCE(s.username,s.name,''))
 WHERE j.status='new'
-  AND j.contact IS NOT NULL
-  AND j.contact!=''
   AND COALESCE(j.selector_status,'') IN ('','held_time')
 ORDER BY j.id ASC
 LIMIT 1000
@@ -312,6 +311,9 @@ blocked = 0
 
 for row in rows:
     text = (row["raw_text"] or "") + "\n" + (row["title"] or "")
+    contact = row["contact"] or extract_telegram_contact(row["raw_text"] or "", row["source"] or "")
+    if contact and not row["contact"]:
+        con.execute("UPDATE jobs SET contact=? WHERE id=?", (contact, row["id"]))
 
     # Level 2 safety: selector requires positive employer/recruiter hiring intent.
     classification = classify_post(text)
@@ -323,7 +325,10 @@ for row in rows:
         rejected += 1
         continue
 
-    if already_blocked(con,row["contact"]):
+    if not contact:
+        continue
+
+    if already_blocked(con, contact):
         con.execute(
             "UPDATE jobs SET selector_status='blocked_contact' WHERE id=?",
             (row["id"],)
@@ -376,8 +381,8 @@ for row in rows:
     )
     VALUES(?,?,?,?,?,'pending')
     """,(
-        f"job-{row['id']}-{norm_contact(row['contact']).replace('@','')}",
-        row["contact"],
+        f"job-{row['id']}-{norm_contact(contact).replace('@','')}",
+        contact,
         msg,
         CV,
         row["job_id"]
