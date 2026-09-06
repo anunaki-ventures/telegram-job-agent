@@ -8,23 +8,29 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.errors import FloodWaitError, ChatWriteForbiddenError, UserBannedInChannelError
-from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import Channel, Chat
+from telethon.tl import types
 
 APP = Path('/opt/tg-job-agent')
 DB = APP / 'telegram_jobs.db'
 SESSION = str(APP / 'telegram_poster')
-SESSION_DB = APP / 'telegram_poster.session'
+SESSION_CACHES = [
+    APP / 'telegram_poster.session',
+    APP / 'telegram_worker.session',
+    APP / 'telegram_scanner.session',
+    APP / 'telegram_discovery.session',
+    APP / 'telegram.session',
+]
 load_dotenv(APP / '.env')
 API_ID = int(os.environ['TG_API_ID'])
 API_HASH = os.environ['TG_API_HASH']
 
 COOLDOWN_DAYS = 14
+DAILY_POST_TARGET = 3
 MAX_POSTS_PER_RUN = 3
-INTER_POST_MIN = 120
-INTER_POST_MAX = 300
+INTER_POST_MIN = 600
+INTER_POST_MAX = 900
 
 EN_MSG = (
     "Hello! I’m open to new opportunities in operations, project/operations management, "
@@ -68,6 +74,7 @@ EUROPE_COUNTRIES = {
     'latvia','lithuania','luxembourg'
 }
 
+
 def priority(country):
     c = (country or '').strip().lower()
     if c in PRIORITY_COUNTRIES:
@@ -76,8 +83,10 @@ def priority(country):
         return 2
     return 1
 
+
 def cols(conn, table):
     return [r[1] for r in conn.execute(f'pragma table_info("{table}")')]
+
 
 def pick(candidates, available):
     low = {x.lower(): x for x in available}
@@ -86,28 +95,28 @@ def pick(candidates, available):
             return low[c]
     return None
 
+
 def norm_handle(v):
     if v is None:
         return None
     s = str(v).strip()
     if not s:
         return None
-    if s.startswith('https://t.me/'):
-        s = s.split('https://t.me/', 1)[1].split('?', 1)[0].strip('/')
-    if s.startswith('http://t.me/'):
-        s = s.split('http://t.me/', 1)[1].split('?', 1)[0].strip('/')
-    if s.startswith('t.me/'):
-        s = s.split('t.me/', 1)[1].split('?', 1)[0].strip('/')
+    for prefix in ('https://t.me/', 'http://t.me/', 't.me/'):
+        if s.startswith(prefix):
+            s = s.split(prefix, 1)[1].split('?', 1)[0].strip('/')
     if s.startswith('@'):
-        return s
+        s = s[1:]
     if re.fullmatch(r'[A-Za-z0-9_]{5,}', s):
         return '@' + s
     return None
+
 
 def russianish(text):
     cyr = len(re.findall(r'[А-Яа-яЁё]', text or ''))
     lat = len(re.findall(r'[A-Za-z]', text or ''))
     return cyr > lat and cyr >= 10
+
 
 def allowed_by_rules(text):
     t = (text or '').lower()
@@ -115,17 +124,57 @@ def allowed_by_rules(text):
         return False
     return any(re.search(p, t, re.S) for p in POSITIVE)
 
-def cached_usernames():
-    if not SESSION_DB.exists():
-        return set()
-    con = sqlite3.connect(SESSION_DB, timeout=10)
-    try:
-        return {
-            (r[0] or '').lower()
-            for r in con.execute("select username from entities where username is not null and username!=''")
-        }
-    finally:
-        con.close()
+
+def cached_group_peer(handle):
+    username = (handle or '').lstrip('@').lower()
+    if not username:
+        return None
+    for path in SESSION_CACHES:
+        if not path.exists():
+            continue
+        try:
+            con = sqlite3.connect(path, timeout=2)
+            row = con.execute(
+                "SELECT id,hash FROM entities WHERE lower(COALESCE(username,''))=? LIMIT 1",
+                (username,),
+            ).fetchone()
+            con.close()
+        except Exception:
+            row = None
+        if not row:
+            continue
+        marked_id = int(row[0])
+        access_hash = int(row[1] or 0)
+        real_id, peer_type = utils.resolve_id(marked_id)
+        # Job-seeker ads are posted only to chats/groups, never private users.
+        if peer_type is types.PeerChannel:
+            return types.InputPeerChannel(real_id, access_hash)
+        if peer_type is types.PeerChat:
+            return types.InputPeerChat(real_id)
+    return None
+
+
+def cached_group_usernames():
+    names = set()
+    for path in SESSION_CACHES:
+        if not path.exists():
+            continue
+        try:
+            con = sqlite3.connect(path, timeout=2)
+            for marked_id, username in con.execute(
+                "SELECT id,username FROM entities WHERE username IS NOT NULL AND username!=''"
+            ):
+                try:
+                    _, peer_type = utils.resolve_id(int(marked_id))
+                except Exception:
+                    continue
+                if peer_type in (types.PeerChannel, types.PeerChat):
+                    names.add(str(username).lower())
+            con.close()
+        except Exception:
+            pass
+    return names
+
 
 async def main():
     conn = sqlite3.connect(DB, timeout=30)
@@ -143,6 +192,15 @@ async def main():
     conn.execute('create index if not exists ix_seeker_posts_key_time on seeker_group_posts(source_key,posted_at)')
     conn.commit()
 
+    sent_today = conn.execute(
+        "SELECT COUNT(*) FROM seeker_group_posts WHERE status='sent' AND posted_at>=date('now')"
+    ).fetchone()[0]
+    remaining_today = max(0, DAILY_POST_TARGET - sent_today)
+    if remaining_today == 0:
+        print('SEEKER_POSTER DAILY_TARGET_MET', sent_today)
+        conn.close()
+        return
+
     available = cols(conn, 'sources')
     handle_col = pick(['username','handle','telegram_username','source_username','chat_username','url','link','source'], available)
     title_col = pick(['title','name','source_name','chat_title'], available)
@@ -153,7 +211,7 @@ async def main():
         conn.close()
         return
 
-    cached = cached_usernames()
+    cached = cached_group_usernames()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=COOLDOWN_DAYS)).isoformat()
     rows = conn.execute('SELECT rowid,* FROM sources ORDER BY rowid DESC').fetchall()
 
@@ -184,41 +242,36 @@ async def main():
                            str(d.get(title_col) or ''), str(d.get(country_col) or '') if country_col else ''))
 
     candidates.sort(key=lambda x: (x[0], x[1]))
-    print('SEEKER_POSTER candidates_cached_writable=', len(candidates), 'cache=', len(cached))
+    print('SEEKER_POSTER candidates_cached_writable=', len(candidates), 'cache=', len(cached),
+          'sent_today=', sent_today, 'remaining_today=', remaining_today)
 
     posted = 0
+    run_limit = min(MAX_POSTS_PER_RUN, remaining_today)
     client = TelegramClient(SESSION, API_ID, API_HASH)
     await client.start()
     try:
         for _, _, handle, title_hint, country in candidates:
-            if posted >= MAX_POSTS_PER_RUN:
+            if posted >= run_limit:
                 break
             key = handle.lower()
             try:
-                entity = await client.get_entity(handle)
-                if isinstance(entity, Channel) and not getattr(entity, 'megagroup', False):
-                    continue
-                if not isinstance(entity, (Channel, Chat)):
+                entity = cached_group_peer(handle)
+                if entity is None:
+                    print('SEEKER_POST_UNCACHED', key)
                     continue
 
-                title = getattr(entity, 'title', None) or title_hint or key
-                about = ''
-                try:
-                    if isinstance(entity, Channel):
-                        full = await client(GetFullChannelRequest(entity))
-                        about = getattr(full.full_chat, 'about', '') or ''
-                except Exception:
-                    pass
-
+                # No get_entity(username): this avoids ResolveUsernameRequest FloodWait.
                 recent = []
                 try:
                     async for m in client.iter_messages(entity, limit=35):
                         if m.message:
                             recent.append(m.message)
+                except FloodWaitError:
+                    raise
                 except Exception:
                     pass
 
-                evidence = '\n'.join([title, about] + recent[:35])[:40000]
+                evidence = '\n'.join([title_hint] + recent[:35])[:40000]
                 if not allowed_by_rules(evidence):
                     continue
 
@@ -228,12 +281,13 @@ async def main():
                 ts = datetime.now(timezone.utc).isoformat()
                 conn.execute(
                     'insert into seeker_group_posts(source_key,group_title,posted_at,telegram_message_id,language,status,note) values(?,?,?,?,?,?,?)',
-                    (key, title, ts, getattr(sent, 'id', None), lang, 'sent', f'rules positive; no CV attached; country={country}')
+                    (key, title_hint or key, ts, getattr(sent, 'id', None), lang, 'sent',
+                     f'rules positive; no CV attached; country={country}; cache-only')
                 )
                 conn.commit()
                 posted += 1
-                print('SEEKER_POST_SENT', key, title, getattr(sent, 'id', None), lang)
-                if posted < MAX_POSTS_PER_RUN:
+                print('SEEKER_POST_SENT', key, title_hint or key, getattr(sent, 'id', None), lang)
+                if posted < run_limit:
                     await asyncio.sleep(random.uniform(INTER_POST_MIN, INTER_POST_MAX))
 
             except FloodWaitError as e:
@@ -252,7 +306,9 @@ async def main():
         await client.disconnect()
         conn.close()
 
-    print('SEEKER_POSTER_DONE posted=', posted, 'cooldown_days=', COOLDOWN_DAYS, 'max_per_run=', MAX_POSTS_PER_RUN)
+    print('SEEKER_POSTER_DONE posted=', posted, 'daily_target=', DAILY_POST_TARGET,
+          'cooldown_days=', COOLDOWN_DAYS, 'max_per_run=', MAX_POSTS_PER_RUN)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
