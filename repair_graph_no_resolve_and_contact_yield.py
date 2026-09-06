@@ -113,10 +113,9 @@ if 'def source_contact_rank(' not in t:
         contact_stats = {
             (r['source_key'] or ''): (int(r['contact_jobs'] or 0), int(r['total_jobs'] or 0))
             for r in stats_con.execute(
-                """SELECT lower(COALESCE(source,'')) AS source_key,
-                          SUM(CASE WHEN contact IS NOT NULL AND contact!='' THEN 1 ELSE 0 END) AS contact_jobs,
-                          COUNT(*) AS total_jobs
-                   FROM jobs GROUP BY lower(COALESCE(source,''))"""
+                "SELECT lower(COALESCE(source,'')) AS source_key, "
+                "SUM(CASE WHEN contact IS NOT NULL AND contact!='' THEN 1 ELSE 0 END) AS contact_jobs, "
+                "COUNT(*) AS total_jobs FROM jobs GROUP BY lower(COALESCE(source,''))"
             )
         }
     finally:
