@@ -19,8 +19,8 @@ def _num(raw: str) -> float:
 def _money_tokens(text: str):
     """Return explicit USD/EUR/GBP money values with offsets."""
     patterns = [
-        r'(?P<cur>\$|€|£)\s*(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d{3,6})(?:\.\d+)?',
-        r'(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d{3,6})(?:\.\d+)?\s*(?P<cur>usd|eur|gbp|\$|€|£)',
+        r'(?P<cur>\$|€|£)\s*(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d{1,6})(?:\.\d+)?',
+        r'(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d{1,6})(?:\.\d+)?\s*(?P<cur>usd|eur|gbp|\$|€|£)',
     ]
     out = []
     for p in patterns:
@@ -63,7 +63,6 @@ def salary_decision(text: str) -> SalaryDecision:
 
     for start, end, value, cur in tokens:
         local_left = t[max(0, start - 50):start]
-        local_right = t[end:min(len(t), end + 50)]
         context = t[max(0, start - 80):min(len(t), end + 100)]
 
         # A separately quoted bonus/commission/OTE amount is variable compensation,
@@ -84,13 +83,10 @@ def salary_decision(text: str) -> SalaryDecision:
     salary_candidates = [x for x in candidates if x[3]] or candidates
     guaranteed_candidates = [x for x in salary_candidates if not x[4]]
 
-    # "Salary up to $3000" does not guarantee a 2k base.
     if not guaranteed_candidates and salary_candidates:
         maximum = max(x[1] for x in salary_candidates)
         return SalaryDecision(False, 'maximum_only_not_guaranteed_2000', maximum)
 
-    # In a range, or with "from/start", the lower non-variable figure is the
-    # guaranteed side. Bonus/commission is deliberately excluded above.
     guaranteed = min(x[1] for x in guaranteed_candidates)
     if guaranteed < MONTHLY_FLOOR:
         return SalaryDecision(False, f'guaranteed_base_below_{MONTHLY_FLOOR}', guaranteed)
