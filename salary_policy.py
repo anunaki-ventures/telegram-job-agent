@@ -17,15 +17,10 @@ def _num(raw: str) -> float:
 
 
 def _money_tokens(text: str):
-    """Return explicit USD/EUR/GBP salary numbers with offsets.
-
-    Local-currency numbers without one of these currencies are deliberately ignored;
-    the 2k policy is a hard-currency monthly floor and must not confuse phone numbers,
-    years, local salaries or bonuses with guaranteed base pay.
-    """
+    """Return explicit USD/EUR/GBP money values with offsets."""
     patterns = [
         r'(?P<cur>\$|€|£)\s*(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d{3,6})(?:\.\d+)?',
-        r'(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d{3,6})(?:\.\d+)?\s*(?P<cur>usd|eur|gbp|\$|€|£)\b?',
+        r'(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d{3,6})(?:\.\d+)?\s*(?P<cur>usd|eur|gbp|\$|€|£)',
     ]
     out = []
     for p in patterns:
@@ -34,7 +29,6 @@ def _money_tokens(text: str):
                 out.append((m.start(), m.end(), _num(m.group('num')), m.group('cur').lower()))
             except Exception:
                 pass
-    # de-duplicate overlapping symbol/code matches
     dedup = []
     for item in sorted(out):
         if any(not (item[1] <= x[0] or item[0] >= x[1]) for x in dedup):
@@ -43,7 +37,7 @@ def _money_tokens(text: str):
     return dedup
 
 
-def _monthly_equivalent(value: float, context: str) -> Optional[float]:
+def _monthly_equivalent(value: float, context: str) -> float:
     c = context.lower()
     if re.search(r'/(?:h|hr|hour)\b|per\s+hour|hourly|в\s+час|час(?:овой|овая)?', c):
         return value * 160.0
@@ -51,8 +45,6 @@ def _monthly_equivalent(value: float, context: str) -> Optional[float]:
         return value / 12.0
     if re.search(r'/(?:week|wk)\b|per\s+week|weekly|в\s+недел', c):
         return value * 4.33
-    # Explicit month markers or no explicit period: Telegram vacancy salaries are
-    # treated as monthly by default, matching the project's established $2k/mo rule.
     return value
 
 
@@ -62,38 +54,44 @@ def salary_decision(text: str) -> SalaryDecision:
     if not tokens:
         return SalaryDecision(True, 'salary_unknown_or_no_hard_currency')
 
-    # Ignore obvious one-off/project budgets when the text explicitly says project fee.
     if re.search(r'project\s+(?:fee|budget)|one[- ]off|fixed\s+project|за\s+проект', t):
         return SalaryDecision(True, 'project_compensation_not_monthly')
 
-    # Prefer values appearing near salary/base/pay/compensation markers. If none do,
-    # still evaluate explicit hard-currency amounts because job ads commonly use
-    # terse titles such as "Sales Manager — $1000 + bonus".
     salary_words = r'salary|base|base pay|base salary|compensation|pay|оклад|зарплат|зп|ставка|fixed'
+    variable_words = r'bonus|commission|incentive|variable|ote|бонус|комисс|преми'
     candidates = []
+
     for start, end, value, cur in tokens:
-        left = max(0, start - 80)
-        right = min(len(t), end + 100)
-        context = t[left:right]
-        monthly = _monthly_equivalent(value, context)
-        if monthly is None:
+        local_left = t[max(0, start - 50):start]
+        local_right = t[end:min(len(t), end + 50)]
+        context = t[max(0, start - 80):min(len(t), end + 100)]
+
+        # A separately quoted bonus/commission/OTE amount is variable compensation,
+        # not guaranteed base. It must neither rescue a low base nor invalidate a
+        # valid >=2k base.
+        variable_amount = bool(re.search(rf'(?:{variable_words})[^\n]{{0,24}}$', local_left))
+        if variable_amount:
             continue
+
+        monthly = _monthly_equivalent(value, context)
         near_salary = bool(re.search(salary_words, context))
-        candidates.append((start, value, monthly, context, near_salary))
+        upper_bound_only = bool(re.search(r'(?:up\s+to|max(?:imum)?(?:\s+of)?|до)\s*[:\-]?\s*$', local_left))
+        candidates.append((start, monthly, context, near_salary, upper_bound_only))
 
     if not candidates:
-        return SalaryDecision(True, 'salary_not_comparable')
+        return SalaryDecision(True, 'only_variable_compensation_amounts_visible')
 
-    salary_candidates = [x for x in candidates if x[4]] or candidates
+    salary_candidates = [x for x in candidates if x[3]] or candidates
+    guaranteed_candidates = [x for x in salary_candidates if not x[4]]
 
-    # "up to / maximum" never establishes a guaranteed >=2k base.
-    for _, value, monthly, context, _ in salary_candidates:
-        if re.search(r'up\s+to|max(?:imum)?|до\s*[\$€£]?\s*\d', context) and monthly >= MONTHLY_FLOOR:
-            return SalaryDecision(False, 'maximum_only_not_guaranteed_2000', monthly)
+    # "Salary up to $3000" does not guarantee a 2k base.
+    if not guaranteed_candidates and salary_candidates:
+        maximum = max(x[1] for x in salary_candidates)
+        return SalaryDecision(False, 'maximum_only_not_guaranteed_2000', maximum)
 
-    # For salary ranges or "from/start" offers, the lowest explicit hard-currency
-    # amount is the guaranteed side of the offer. Bonuses/commission never raise it.
-    guaranteed = min(x[2] for x in salary_candidates)
+    # In a range, or with "from/start", the lower non-variable figure is the
+    # guaranteed side. Bonus/commission is deliberately excluded above.
+    guaranteed = min(x[1] for x in guaranteed_candidates)
     if guaranteed < MONTHLY_FLOOR:
         return SalaryDecision(False, f'guaranteed_base_below_{MONTHLY_FLOOR}', guaranteed)
 
