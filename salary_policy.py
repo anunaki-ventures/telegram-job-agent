@@ -2,7 +2,8 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-MONTHLY_FLOOR = 2000
+MONTHLY_TARGET = 2000
+MIN_BASE_WITH_UPSIDE = 1600
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,15 @@ def _monthly_equivalent(value: float, context: str) -> float:
 
 
 def salary_decision(text: str) -> SalaryDecision:
+    """Salary policy for automatic applications.
+
+    Unknown/negotiable salary remains eligible. For explicit hard-currency pay:
+    - fixed/base >= 2000/month is eligible;
+    - base >= 1600 with explicit bonus/commission/variable upside is eligible;
+    - a range is eligible when its lower bound is >=1600 and upper bound reaches >=2000;
+    - an "up to" amount is eligible when the ceiling reaches >=2000;
+    - low-base offers such as $1000 + bonus remain ineligible.
+    """
     t = (text or '').lower().replace('\u00a0', ' ')
     tokens = _money_tokens(t)
     if not tokens:
@@ -59,6 +69,7 @@ def salary_decision(text: str) -> SalaryDecision:
 
     salary_words = r'salary|base|base pay|base salary|compensation|pay|оклад|зарплат|зп|ставка|fixed'
     variable_words = r'bonus|commission|incentive|variable|ote|бонус|комисс|преми'
+    has_variable_upside = bool(re.search(variable_words, t))
     candidates = []
 
     for start, end, value, cur in tokens:
@@ -66,8 +77,7 @@ def salary_decision(text: str) -> SalaryDecision:
         context = t[max(0, start - 80):min(len(t), end + 100)]
 
         # A separately quoted bonus/commission/OTE amount is variable compensation,
-        # not guaranteed base. It must neither rescue a low base nor invalidate a
-        # valid >=2k base.
+        # not base pay. Exclude it from base/range calculations.
         variable_amount = bool(re.search(rf'(?:{variable_words})[^\n]{{0,24}}$', local_left))
         if variable_amount:
             continue
@@ -81,17 +91,33 @@ def salary_decision(text: str) -> SalaryDecision:
         return SalaryDecision(True, 'only_variable_compensation_amounts_visible')
 
     salary_candidates = [x for x in candidates if x[3]] or candidates
-    guaranteed_candidates = [x for x in salary_candidates if not x[4]]
+    upper_only = [x for x in salary_candidates if x[4]]
+    base_candidates = [x for x in salary_candidates if not x[4]]
 
-    if not guaranteed_candidates and salary_candidates:
-        maximum = max(x[1] for x in salary_candidates)
-        return SalaryDecision(False, 'maximum_only_not_guaranteed_2000', maximum)
+    # "up to $3000" is now eligible; "up to $1800" is not.
+    if not base_candidates and upper_only:
+        ceiling = max(x[1] for x in upper_only)
+        if ceiling >= MONTHLY_TARGET:
+            return SalaryDecision(True, f'ceiling_reaches_{MONTHLY_TARGET}', None)
+        return SalaryDecision(False, f'ceiling_below_{MONTHLY_TARGET}', ceiling)
 
-    guaranteed = min(x[1] for x in guaranteed_candidates)
-    if guaranteed < MONTHLY_FLOOR:
-        return SalaryDecision(False, f'guaranteed_base_below_{MONTHLY_FLOOR}', guaranteed)
+    values = [x[1] for x in base_candidates]
+    low = min(values)
+    high = max(values)
 
-    return SalaryDecision(True, f'guaranteed_base_at_least_{MONTHLY_FLOOR}', guaranteed)
+    if low >= MONTHLY_TARGET:
+        return SalaryDecision(True, f'base_at_least_{MONTHLY_TARGET}', low)
+
+    # Explicit range such as 1600-2100: allow only when the low end is not too low
+    # and the range reaches the 2k target.
+    if len(values) >= 2 and low >= MIN_BASE_WITH_UPSIDE and high >= MONTHLY_TARGET:
+        return SalaryDecision(True, 'range_reaches_target', low)
+
+    # 1900 + commission is eligible, while 1000 + bonus is still rejected.
+    if has_variable_upside and low >= MIN_BASE_WITH_UPSIDE:
+        return SalaryDecision(True, 'base_with_variable_upside', low)
+
+    return SalaryDecision(False, f'explicit_pay_below_policy_floor_{MIN_BASE_WITH_UPSIDE}_or_no_2k_upside', low)
 
 
 def salary_rejection_reason(text: str) -> Optional[str]:
