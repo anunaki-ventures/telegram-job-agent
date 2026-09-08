@@ -118,6 +118,44 @@ def selector_keywords():
     return values
 
 
+# ROUTE_TITLE_FIT_V1
+ROUTE_TITLE_GOOD = [
+    'general manager','operations manager','operation manager','operations director','operational director',
+    'project manager','program manager','property manager','construction manager','development manager',
+    'business development manager','business development','business manager','sales manager','account manager','customer success manager',
+    'procurement manager','purchasing manager','supply chain manager','logistics manager','warehouse manager','production manager',
+    'e-commerce manager','ecommerce manager','marketplace manager','partnerships manager','expansion manager','branch manager',
+    'country manager','regional manager','area manager','hotel manager','resort manager','restaurant manager','f&b manager',
+    'office manager','service manager','community manager','managing director','commercial director','head of operations',
+    'head of business development','head of sales','chief operating officer','coo',
+    'операционный директор','директор по операциям','руководитель проектов','менеджер проектов','менеджер по продажам',
+    'руководитель отдела продаж','региональный менеджер','директор по развитию','менеджер по развитию бизнеса',
+    'gerente de operaciones','director de operaciones','gerente de proyectos','gerente de proyecto','gerente comercial',
+    'gerente de ventas','gerente regional','gerente de logistica','gerente de logística','gerente de compras','gerente general',
+    'gerente de operações','diretor de operações','gerente de projetos','gerente comercial','gerente de vendas','gerente regional',
+    'gerente de logística','gerente de suprimentos','gerente geral',
+    '项目经理','运营经理','销售经理','商务拓展','总经理','运营总监'
+]
+ROUTE_TITLE_BAD = [
+    'junior','intern','internship','trainee','cleaner','cleaning','limpeza','housekeeping associate','analyst','engineer',
+    'developer','designer','social media','accountant','accounting','finance & accounting','finance and accounting','data scientist','software','frontend','backend','qa ',
+    'стажер','стажёр','убор','аналитик','разработчик','дизайнер'
+]
+
+def title_fit_ok(title):
+    x = (title or '').lower()
+    if any(b in x for b in ROUTE_TITLE_BAD):
+        return False
+    if 'business development' in x and not any(k in x for k in ('manager','director','head','lead','chief')):
+        return False
+    return any(g in x for g in ROUTE_TITLE_GOOD)
+
+def route_text_ok(text):
+    x=(text or '').lower()
+    blocked=[r'chinese[- ]speaking',r'mandarin(?:\s+is)?\s+required',r'fluent\s+(?:in\s+)?chinese',r'korean[- ]speaking',r'japanese\s+n[12]',r'saudi\s+(?:national|only)',r'uae\s+national',r'emirati\s+only',r'thai\s+national',r'nationals?\s+only',r'citizens?\s+only']
+    return not any(re.search(p,x,re.I) for p in blocked)
+
+
 def fit_ok(text, kw):
     t = (text or '').lower()
     good = kw.get('GOOD') or []
@@ -369,7 +407,7 @@ def route_jobs(limit=3000):
         cl = classify_post(text)
         if not cl.is_employer_post:
             stats['unsafe'] += 1; continue
-        if not fit_ok(text, kw):
+        if not fit_ok(text, kw) or not title_fit_ok(row['title']) or not route_text_ok(text):
             stats['unfit'] += 1; continue
         sr = salary_rejection_reason(text)
         if sr:
@@ -403,7 +441,12 @@ def route_jobs(limit=3000):
 def claim(kind, n):
     con=db(); ensure_schema(con)
     con.execute('BEGIN IMMEDIATE')
-    rows=con.execute("SELECT * FROM application_routes WHERE route_kind=? AND status='pending' ORDER BY id ASC LIMIT ?", (kind,int(n))).fetchall()
+    requested=int(n)
+    if kind == 'email':
+        cutoff=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
+        recent=con.execute("SELECT COUNT(*) FROM application_routes WHERE route_kind='email' AND status IN ('processing','sent') AND updated_at>=?",(cutoff,)).fetchone()[0]
+        requested=max(0,min(requested,5-int(recent)))
+    rows=con.execute("SELECT * FROM application_routes WHERE route_kind=? AND status='pending' ORDER BY id ASC LIMIT ?", (kind,requested)).fetchall()
     ids=[r['id'] for r in rows]
     if ids:
         marks=','.join('?' for _ in ids)

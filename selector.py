@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from candidate_classifier import classify_post
+from salary_policy import salary_rejection_reason
 from telegram_contact import extract_telegram_contact
 
 ROOT = Path("/opt/tg-job-agent")
@@ -74,18 +75,26 @@ EUROPE_COUNTRIES = {
 }
 
 GOOD = [
-    "general manager","operations manager","operation manager",
-    "project manager","program manager","property manager",
-    "construction manager","development manager",
-    "business development manager","business development",
-    "sales manager","account manager","customer success",
-    "procurement manager","purchasing manager",
-    "supply chain","logistics manager","warehouse manager",
-    "production manager","e-commerce manager","ecommerce manager",
-    "marketplace manager","partnerships manager","expansion manager",
-    "branch manager","country manager","regional manager","area manager",
-    "hotel manager","resort manager","restaurant manager","f&b manager",
-    "office manager","service manager","community manager"
+    "general manager","operations manager","operation manager","project manager","program manager",
+    "property manager","construction manager","development manager","business development manager",
+    "business development","sales manager","account manager","customer success","procurement manager",
+    "purchasing manager","supply chain","logistics manager","warehouse manager","production manager",
+    "e-commerce manager","ecommerce manager","marketplace manager","partnerships manager","expansion manager",
+    "branch manager","country manager","regional manager","area manager","hotel manager","resort manager",
+    "restaurant manager","f&b manager","office manager","service manager","community manager",
+    "gerente general","gerente de operaciones","gerente de proyectos","jefe de proyecto","desarrollo de negocios",
+    "gerente comercial","gerente de ventas","gerente de cuentas","éxito del cliente","logística","compras",
+    "cadena de suministro","gerente de almacén","gerente de producción","comercio electrónico","alianzas","expansión",
+    "gerente geral","gerente de operações","gerente de projetos","desenvolvimento de negócios","gerente de vendas",
+    "gerente de contas","sucesso do cliente","cadeia de suprimentos","gerente de armazém","gerente de produção","parcerias",
+    "manajer proyek","manajer operasional","manajer penjualan","pengembangan bisnis","pengadaan","rantai pasok",
+    "quản lý dự án","quản lý vận hành","phát triển kinh doanh","quản lý bán hàng","quản lý kho","chuỗi cung ứng",
+    "项目经理","运营经理","业务发展","销售经理","采购经理","供应链","物流经理","总经理",
+    "プロジェクトマネージャー","オペレーションマネージャー","営業マネージャー","事業開発","物流","調達","サプライチェーン",
+    "프로젝트 매니저","운영 매니저","영업 매니저","사업개발","물류","구매","공급망",
+    "ผู้จัดการโครงการ","ผู้จัดการฝ่ายปฏิบัติการ","ผู้จัดการฝ่ายขาย","พัฒนาธุรกิจ","โลจิสติกส์","จัดซื้อ","ซัพพลายเชน",
+    "генеральный менеджер","операционный менеджер","руководитель проекта","менеджер проекта","развитие бизнеса",
+    "менеджер по продажам","аккаунт-менеджер","логистика","закупки","цепочка поставок"
 ]
 
 BAD = [
@@ -99,7 +108,9 @@ HARD_TECH = [
     "senior software engineer","developer","devops","data scientist",
     "machine learning engineer","cybersecurity engineer",
     "java developer","python developer","frontend developer",
-    "backend developer","full stack developer"
+    "backend developer","full stack developer",
+    "operations research engineer","optimization engineer","mathematical optimization",
+    "milp","constraint programming","or-tools","cp-sat","gurobi","cplex"
 ]
 
 def db():
@@ -186,11 +197,19 @@ def infer_country(row):
 
 def region_priority(row):
     country = (infer_country(row) or '').strip().lower()
-    if country in PRIORITY_COUNTRIES:
+    if any(x in country for x in PRIORITY_COUNTRIES):
         return 0
-    if country in EUROPE_COUNTRIES:
+    if any(x in country for x in EUROPE_COUNTRIES):
         return 2
     return 1
+
+def global_remote_without_specific_country(row):
+    label = ' '.join([str(row['country'] or ''), str(row['source_country'] or '')]).lower()
+    broad = any(x in label for x in ('global', 'worldwide', 'remote', 'latam'))
+    if not broad:
+        return False
+    specific = any(country in label for country in COUNTRY_TZ.keys())
+    return not specific
 
 def allowed_now(country, source_timezone=None):
     tzname = (source_timezone or '').strip()
@@ -222,33 +241,12 @@ def fit(text):
     return any(x in t for x in GOOD)
 
 def salary_too_low(text):
-    t = text.lower()
-
-    patterns = [
-        r'(\d{3,5})\s*(usd|eur)',
-        r'\$\s*(\d{3,5})',
-        r'€\s*(\d{3,5})'
-    ]
-
-    vals = []
-
-    for p in patterns:
-        for m in re.finditer(p,t):
-            try:
-                if m.group(1).isdigit():
-                    vals.append(int(m.group(1)))
-            except:
-                pass
-
-    if vals and max(vals) < 2000:
-        return True
-
-    return False
+    return salary_rejection_reason(text) is not None
 
 def language(text):
     cyr = sum(1 for ch in text if "а" <= ch.lower() <= "я")
     lat = sum(1 for ch in text if "a" <= ch.lower() <= "z")
-    return "ru" if cyr > lat * 0.25 else "en"
+    return "ru" if cyr >= 20 and cyr > lat * 1.5 else "en"
 
 def make_message(row):
     title = (row["title"] or "the position").strip()
@@ -302,12 +300,18 @@ LIMIT 1000
 
 # Founder priority: SEA + China/Japan/Korea + LATAM + Spain/Portugal first;
 # other non-European jobs next; the rest of Europe last.
-rows = sorted(rows, key=lambda r: (region_priority(r), r['id']))[:250]
+def selection_window_priority(row):
+    country = infer_country(row)
+    ok, _, _ = allowed_now(country, row['source_timezone'])
+    return 0 if ok else 1
+
+rows = sorted(rows, key=lambda r: (selection_window_priority(r), region_priority(r), r['id']))[:250]
 
 queued = 0
 held_time = 0
 rejected = 0
 blocked = 0
+no_contact = 0  # selector-starvation-fix
 
 for row in rows:
     text = (row["raw_text"] or "") + "\n" + (row["title"] or "")
@@ -326,6 +330,8 @@ for row in rows:
         continue
 
     if not contact:
+        con.execute("UPDATE jobs SET selector_status='no_telegram_contact' WHERE id=?", (row['id'],))
+        no_contact += 1
         continue
 
     if already_blocked(con, contact):
@@ -352,7 +358,10 @@ for row in rows:
             (country,row["id"])
         )
 
-    ok, tz, localtime = allowed_now(country, row["source_timezone"])
+    if global_remote_without_specific_country(row):
+        ok, tz, localtime = True, '', 'global-remote'
+    else:
+        ok, tz, localtime = allowed_now(country, row["source_timezone"])
 
     if tz:
         con.execute(
@@ -402,9 +411,17 @@ print("queued:",queued)
 print("held_time:",held_time)
 print("rejected:",rejected)
 print("blocked_contact:",blocked)
+print("no_telegram_contact:",no_contact)
 print("pending_queue:",con.execute(
     "SELECT COUNT(*) FROM send_queue WHERE status='pending'"
 ).fetchone()[0])
 print("integrity:",con.execute("PRAGMA integrity_check").fetchone()[0])
 
 con.close()
+
+# MULTICHANNEL_ROUTER_AFTER_SELECTOR_V1
+try:
+    import subprocess as _mcr_subprocess, sys as _mcr_sys
+    _mcr_subprocess.run([_mcr_sys.executable, "/opt/tg-job-agent/channel_router.py"], timeout=120, check=False)
+except Exception as _mcr_e:
+    print("MULTICHANNEL_ROUTER_ERROR", repr(_mcr_e))
