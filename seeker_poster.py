@@ -12,7 +12,7 @@ from telethon import TelegramClient, utils
 from telethon.errors import FloodWaitError, ChatWriteForbiddenError, UserBannedInChannelError
 from telethon.tl import types
 
-APP = Path('/opt/tg-job-agent')
+APP = Path(os.environ.get('TG_JOB_AGENT_HOME', '/opt/tg-job-agent'))
 DB = APP / 'telegram_jobs.db'
 SESSION = str(APP / 'telegram_poster')
 SESSION_CACHES = [
@@ -177,6 +177,11 @@ def cached_group_usernames():
 
 
 async def main():
+    if os.environ.get('TG_GROUP_POSTS_ENABLED') != '1':
+        print('GROUP_POSTS_DISABLED: review group permissions and recovered history before enabling')
+        return
+    if not DB.is_file():
+        raise SystemExit(f'GROUP_POSTS_DB_MISSING: {DB}')
     conn = sqlite3.connect(DB, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute('''create table if not exists seeker_group_posts(

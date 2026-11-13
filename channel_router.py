@@ -2,6 +2,7 @@
 import argparse
 import ast
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone, timedelta
@@ -10,8 +11,9 @@ from urllib.parse import urlparse, urlunparse
 
 from candidate_classifier import classify_post
 from salary_policy import salary_rejection_reason
+from route_approval import approved_metadata
 
-ROOT = Path('/opt/tg-job-agent')
+ROOT = Path(os.environ.get('TG_JOB_AGENT_HOME', '/opt/tg-job-agent'))
 DB = ROOT / 'telegram_jobs.db'
 SELECTOR = ROOT / 'selector.py'
 
@@ -440,23 +442,40 @@ def route_jobs(limit=3000):
 
 def claim(kind, n):
     con=db(); ensure_schema(con)
+    # A pending route alone is never permission to send a CV or fill an application.
+    if os.environ.get('TG_CHANNEL_OUTBOUND_ENABLED') != '1':
+        print('[]')
+        con.close()
+        return
     con.execute('BEGIN IMMEDIATE')
-    requested=int(n)
+    requested=max(0,int(n))
     if kind == 'email':
         cutoff=(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()
         recent=con.execute("SELECT COUNT(*) FROM application_routes WHERE route_kind='email' AND status IN ('processing','sent') AND updated_at>=?",(cutoff,)).fetchone()[0]
         requested=max(0,min(requested,5-int(recent)))
-    rows=con.execute("SELECT * FROM application_routes WHERE route_kind=? AND status='pending' ORDER BY id ASC LIMIT ?", (kind,requested)).fetchall()
-    ids=[r['id'] for r in rows]
+    # Skip unapproved rows without starving approved items later in the queue.
+    approved=[]
+    if requested:
+        candidates=con.execute("SELECT * FROM application_routes WHERE route_kind=? AND status='pending' ORDER BY id ASC", (kind,)).fetchall()
+        for route in candidates:
+            meta=approved_metadata(con,route)
+            if not meta:
+                continue
+            approved.append((route,meta))
+            if len(approved)>=requested:
+                break
+    ids=[r['id'] for r,_ in approved]
     if ids:
         marks=','.join('?' for _ in ids)
         con.execute(f"UPDATE application_routes SET status='processing',updated_at=? WHERE id IN ({marks})", (now(),*ids))
     con.commit()
     out=[]
-    for r in rows:
-        d=dict(r)
+    for route,meta in approved:
+        d=dict(route)
         try: d['payload']=json.loads(d.get('payload_json') or '{}')
         except Exception: d['payload']={}
+        # Downstream senders must use this exact reviewed PDF, not a generic CV.
+        d.update(meta)
         out.append(d)
     print(json.dumps(out,ensure_ascii=False))
     con.close()
