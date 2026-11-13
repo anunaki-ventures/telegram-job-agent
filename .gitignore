@@ -1,0 +1,30 @@
+# Telegram credentials and authenticated session material
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+*.key
+*.pem
+
+# Local databases and sensitive exports (never put contact histories in public Git)
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.xlsx
+*.xls
+*.csv
+reports/
+cv/
+backups/
+*.tgz
+
+# Local Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
