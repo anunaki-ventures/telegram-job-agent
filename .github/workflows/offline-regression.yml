@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile Python sources without Telegram credentials
-        run: python -m compileall -q worker.py seeker_poster.py scanner.py discover_sources.py selector.py channel_router.py outbound_policy.py excel_export.py
+        run: python -m compileall -q worker.py seeker_poster.py scanner.py discover_sources.py selector.py channel_router.py outbound_policy.py route_approval.py excel_export.py
       - name: Install isolated test runner
         run: python -m pip install --disable-pip-version-check pytest openpyxl
       - name: Run offline regression tests
