@@ -12,8 +12,9 @@ from telethon.tl import types
 from telethon.errors import RPCError, FloodWaitError
 
 from candidate_classifier import classify_post
+from outbound_policy import is_approved
 
-ROOT = Path('/opt/tg-job-agent')
+ROOT = Path(os.environ.get('TG_JOB_AGENT_HOME', '/opt/tg-job-agent'))
 DB = ROOT / 'telegram_jobs.db'
 STATE_DB = ROOT / 'worker_state.db'
 ENV = ROOT / '.env'
@@ -32,6 +33,8 @@ SESSION_CACHES = [
 
 
 def load_env():
+    if not ENV.is_file():
+        return
     for line in ENV.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith('#') or '=' not in line:
@@ -43,7 +46,7 @@ def load_env():
 load_env()
 API_ID = int(os.environ['TG_API_ID'])
 API_HASH = os.environ['TG_API_HASH']
-client = TelegramClient('/opt/tg-job-agent/telegram_worker', API_ID, API_HASH)
+client = TelegramClient(str(ROOT / 'telegram_worker'), API_ID, API_HASH)
 
 
 def db():
@@ -330,6 +333,11 @@ async def process_one(row):
             print('CV MISSING', cv_path)
             return False
 
+        if not is_approved(con, row, cv_path):
+            mark_held(con, row['id'], 'held_approval', 'founder_approval_missing_or_changed', None)
+            print('HOLD_FOUNDER_APPROVAL', row['id'])
+            return False
+
         verified, safety_reason = outbound_employer_verified(con, row)
         if not verified:
             mark_skipped(con, row['id'], 'outbound_safety:' + safety_reason)
@@ -362,6 +370,11 @@ async def process_one(row):
                 print('INVALID_RECIPIENT', recipient, repr(e))
                 return False
 
+        # Recheck immediately before sending: approval is bound to the actual CV bytes.
+        if not is_approved(con, row, cv_path):
+            mark_held(con, row['id'], 'held_approval', 'approval_invalidated_before_send', None)
+            print('HOLD_FOUNDER_APPROVAL_CHANGED', row['id'])
+            return False
         try:
             msg = await client.send_message(entity, message, file=cv_path)
         except FloodWaitError as e:
@@ -382,6 +395,9 @@ async def process_one(row):
 
 
 async def main():
+    if os.environ.get('TG_OUTBOUND_ENABLED') != '1':
+        print('OUTBOUND_DISABLED: set TG_OUTBOUND_ENABLED=1 only after recovered history and founder approvals')
+        return
     if not DB.exists():
         raise SystemExit(f'DB missing: {DB}')
     if not DEFAULT_CV.exists():
